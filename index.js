@@ -7,8 +7,10 @@ const VERIFY_TOKEN    = process.env.VERIFY_TOKEN || 'dra-rosina-2024';
 const WHATSAPP_TOKEN  = process.env.WHATSAPP_TOKEN;
 const PHONE_NUMBER_ID = process.env.PHONE_NUMBER_ID;
 const ANTHROPIC_KEY   = process.env.ANTHROPIC_API_KEY;
+const CALENDLY_TOKEN  = process.env.CALENDLY_TOKEN;
 const PORT            = process.env.PORT || 3000;
-const AGENDA_URL      = 'https://calendar.app.google/xLuGaXyM2UGmtUVX9';
+const AGENDA_URL      = 'https://calendly.com/melissavargass16/dra-rosina';
+const CALENDLY_USER   = 'https://api.calendly.com/users/87bb5c4b-e72c-4fa4-a170-56ae1fbbe967';
 
 const clientes = {};
 
@@ -97,6 +99,81 @@ async function sendButtons(to, bodyText, buttons) {
   }
 }
 
+// ─── CALENDLY ─────────────────────────────────────────────────────
+async function getCitasCliente(email) {
+  try {
+    const res = await axios.get('https://api.calendly.com/scheduled_events', {
+      headers: { Authorization: 'Bearer ' + CALENDLY_TOKEN },
+      params: {
+        organization: CALENDLY_USER,
+        invitee_email: email,
+        status: 'active',
+        count: 5,
+        sort: 'start_time:asc'
+      }
+    });
+    return res.data.collection || [];
+  } catch(e) {
+    console.error('Calendly getCitas:', e.response?.data || e.message);
+    return [];
+  }
+}
+
+async function getCitasPorNombre(nombre) {
+  try {
+    // Busca citas activas proximas
+    const ahora = new Date().toISOString();
+    const res = await axios.get('https://api.calendly.com/scheduled_events', {
+      headers: { Authorization: 'Bearer ' + CALENDLY_TOKEN },
+      params: {
+        user: CALENDLY_USER,
+        status: 'active',
+        min_start_time: ahora,
+        count: 20,
+        sort: 'start_time:asc'
+      }
+    });
+    const eventos = res.data.collection || [];
+
+    // Para cada evento buscar invitados y filtrar por nombre
+    const citasDelCliente = [];
+    for (const evento of eventos) {
+      try {
+        const uuid = evento.uri.split('/').pop();
+        const invRes = await axios.get('https://api.calendly.com/scheduled_events/' + uuid + '/invitees', {
+          headers: { Authorization: 'Bearer ' + CALENDLY_TOKEN }
+        });
+        const invitados = invRes.data.collection || [];
+        const match = invitados.find(inv =>
+          inv.name && inv.name.toLowerCase().includes(nombre.split(' ')[0].toLowerCase())
+        );
+        if (match) {
+          citasDelCliente.push({ evento, invitado: match });
+        }
+      } catch(e) { /* skip */ }
+    }
+    return citasDelCliente;
+  } catch(e) {
+    console.error('Calendly getCitasPorNombre:', e.response?.data || e.message);
+    return [];
+  }
+}
+
+function formatFecha(isoString) {
+  const fecha = new Date(isoString);
+  const opciones = {
+    timeZone: 'America/Matamoros',
+    weekday: 'long',
+    year: 'numeric',
+    month: 'long',
+    day: 'numeric',
+    hour: '2-digit',
+    minute: '2-digit',
+    hour12: true
+  };
+  return fecha.toLocaleDateString('es-MX', opciones);
+}
+
 // ─── FLUJO ────────────────────────────────────────────────────────
 function detSrv(t) {
   const s = t.toLowerCase();
@@ -105,13 +182,18 @@ function detSrv(t) {
   if (s.includes('limpieza')) return SERVICIOS[2];
   if (s.includes('laser') || s.includes('laser')) return SERVICIOS[3];
   if (s.includes('mesoterapia')) return SERVICIOS[4];
-  // por numero
   if (s.includes('1')) return SERVICIOS[0];
   if (s.includes('2')) return SERVICIOS[1];
   if (s.includes('3')) return SERVICIOS[2];
   if (s.includes('4')) return SERVICIOS[3];
   if (s.includes('5')) return SERVICIOS[4];
   return null;
+}
+
+function esPreguntaCita(t) {
+  const s = t.toLowerCase();
+  return (s.includes('cuando') || s.includes('cuándo') || s.includes('que dia') || s.includes('qué día')) &&
+         (s.includes('cita') || s.includes('agendar') || s.includes('reserv') || s.includes('mi cita'));
 }
 
 async function handle(phone, texto) {
@@ -121,6 +203,26 @@ async function handle(phone, texto) {
   const c = clientes[phone];
   const t = (texto || '').toLowerCase().trim();
   console.log('[' + phone + '] (' + c.estado + '): ' + texto);
+
+  // CONSULTA DE CITA en cualquier estado
+  if (c.nombre && esPreguntaCita(t)) {
+    const citas = await getCitasPorNombre(c.nombre);
+    if (citas.length > 0) {
+      const { evento } = citas[0];
+      const fecha = formatFecha(evento.start_time);
+      await sendText(phone,
+        'Tu proxima cita con Mely es el *' + fecha + '* 📅\n\n' +
+        (citas.length > 1 ? 'Tienes ' + citas.length + ' citas agendadas en total.' : '') +
+        '\nCualquier cambio puedes hacerlo en: ' + AGENDA_URL
+      );
+    } else {
+      await sendText(phone,
+        'No encontre citas proximas a tu nombre, ' + c.nombre + '. ' +
+        'Si quieres agendar una, aqui esta el link: 📅 ' + AGENDA_URL
+      );
+    }
+    return;
+  }
 
   // INICIO
   if (c.estado === E.I) {
