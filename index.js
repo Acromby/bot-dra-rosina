@@ -1,8 +1,7 @@
 const express = require('express');
 const axios = require('axios');
-const fs = require('fs');
-const path = require('path');
 const crypto = require('crypto');
+const { Pool } = require('pg');
 const app = express();
 app.use(express.json());
 
@@ -13,9 +12,9 @@ const ANTHROPIC_KEY        = process.env.ANTHROPIC_API_KEY;
 const GOOGLE_SERVICE_EMAIL = process.env.GOOGLE_SERVICE_EMAIL;
 const GOOGLE_PRIVATE_KEY   = (process.env.GOOGLE_PRIVATE_KEY || '').replace(/\\n/g, '\n');
 const GOOGLE_CALENDAR_ID   = process.env.GOOGLE_CALENDAR_ID || 'melissavargass16@gmail.com';
+const DATABASE_URL         = process.env.DATABASE_URL;
 const PORT                 = process.env.PORT || 3000;
 const AGENDA_BASE          = 'https://calendly.com/melissavargass16/dra-rosina';
-const DB_PATH              = path.join('/tmp', 'clientes.json');
 
 const SERVICIOS = [
   'Botox / Toxina botulinica',
@@ -47,45 +46,76 @@ const E = {
   L:  'libre'
 };
 
-// ─── BASE DE DATOS ─────────────────────────────────────────────────
-function loadDB() {
+// ─── POSTGRESQL ─────────────────────────────────────────────────────
+const pool = new Pool({
+  connectionString: DATABASE_URL,
+  ssl: { rejectUnauthorized: false }
+});
+
+async function initDB() {
   try {
-    if (fs.existsSync(DB_PATH)) return JSON.parse(fs.readFileSync(DB_PATH, 'utf8'));
-  } catch(e) { console.error('loadDB:', e.message); }
-  return {};
+    await pool.query(`
+      CREATE TABLE IF NOT EXISTS clientes (
+        phone TEXT PRIMARY KEY,
+        nombre TEXT,
+        correo TEXT,
+        ultimo_srv TEXT,
+        creado_at TIMESTAMP DEFAULT NOW(),
+        actualizado_at TIMESTAMP DEFAULT NOW()
+      )
+    `);
+    console.log('DB lista');
+  } catch(e) {
+    console.error('initDB:', e.message);
+  }
 }
 
-function saveDB(db) {
-  try { fs.writeFileSync(DB_PATH, JSON.stringify(db, null, 2)); }
-  catch(e) { console.error('saveDB:', e.message); }
+async function getClienteDB(phone) {
+  try {
+    const res = await pool.query('SELECT * FROM clientes WHERE phone = $1', [phone]);
+    return res.rows[0] || null;
+  } catch(e) {
+    console.error('getClienteDB:', e.message);
+    return null;
+  }
 }
 
+async function saveClienteDB(phone, nombre, correo, ultimoSrv) {
+  try {
+    await pool.query(`
+      INSERT INTO clientes (phone, nombre, correo, ultimo_srv, actualizado_at)
+      VALUES ($1, $2, $3, $4, NOW())
+      ON CONFLICT (phone) DO UPDATE
+      SET nombre = $2, correo = $3, ultimo_srv = $4, actualizado_at = NOW()
+    `, [phone, nombre, correo, ultimoSrv]);
+  } catch(e) {
+    console.error('saveClienteDB:', e.message);
+  }
+}
+
+// ─── SESIONES EN MEMORIA (solo estado de conversacion) ─────────────
 const sesiones = {};
 
-function getCliente(phone) {
+async function getCliente(phone) {
   if (!sesiones[phone]) {
-    const db = loadDB();
-    const guardado = db[phone] || {};
+    const guardado = await getClienteDB(phone);
     sesiones[phone] = {
       phone,
-      nombre:        guardado.nombre    || null,
-      correo:        guardado.correo    || null,
-      ultimoSrv:     guardado.ultimoSrv || null,
+      nombre:        guardado?.nombre     || null,
+      correo:        guardado?.correo     || null,
+      ultimoSrv:     guardado?.ultimo_srv || null,
       estado:        E.I,
       nombreTemp:    null,
       correoTemp:    null,
       srvPendiente:  null,
-      citaPendiente: null,
       retSet:        false,
     };
   }
   return sesiones[phone];
 }
 
-function guardarCliente(c) {
-  const db = loadDB();
-  db[c.phone] = { nombre: c.nombre, correo: c.correo, ultimoSrv: c.ultimoSrv };
-  saveDB(db);
+async function guardarCliente(c) {
+  await saveClienteDB(c.phone, c.nombre, c.correo, c.ultimoSrv);
 }
 
 function capitalizarNombre(str) {
@@ -107,7 +137,7 @@ async function getGoogleToken() {
   }
   try {
     const now = Math.floor(Date.now() / 1000);
-    const header = base64url(JSON.stringify({ alg: 'RS256', typ: 'JWT' }));
+    const header  = base64url(JSON.stringify({ alg: 'RS256', typ: 'JWT' }));
     const payload = base64url(JSON.stringify({
       iss: GOOGLE_SERVICE_EMAIL,
       scope: 'https://www.googleapis.com/auth/calendar',
@@ -115,19 +145,15 @@ async function getGoogleToken() {
       exp: now + 3600,
       iat: now
     }));
-
     const sign = crypto.createSign('RSA-SHA256');
     sign.update(header + '.' + payload);
     const signature = sign.sign(GOOGLE_PRIVATE_KEY, 'base64')
       .replace(/\+/g, '-').replace(/\//g, '_').replace(/=/g, '');
-
     const jwt = header + '.' + payload + '.' + signature;
-
     const res = await axios.post('https://oauth2.googleapis.com/token', {
       grant_type: 'urn:ietf:params:oauth:grant-type:jwt-bearer',
       assertion: jwt
     });
-
     googleAccessToken = res.data.access_token;
     googleTokenExpiry = Date.now() + (res.data.expires_in * 1000);
     console.log('Google token OK');
@@ -148,16 +174,10 @@ async function getCitaActivaGoogle(nombre) {
       'https://www.googleapis.com/calendar/v3/calendars/' + encodeURIComponent(GOOGLE_CALENDAR_ID) + '/events',
       {
         headers: { Authorization: 'Bearer ' + token },
-        params: {
-          timeMin: ahora,
-          singleEvents: true,
-          orderBy: 'startTime',
-          maxResults: 50
-        }
+        params: { timeMin: ahora, singleEvents: true, orderBy: 'startTime', maxResults: 50 }
       }
     );
     const eventos = res.data.items || [];
-    console.log('Eventos encontrados:', eventos.length);
     const nombreLower = nombre.toLowerCase().split(' ')[0];
     const cita = eventos.find(ev => {
       const titulo = (ev.summary || '').toLowerCase();
@@ -307,17 +327,19 @@ function esNo(t) {
 
 // ─── FLUJO ─────────────────────────────────────────────────────────
 async function handle(phone, texto) {
-  const c = getCliente(phone);
+  const c = await getCliente(phone);
   const t = (texto || '').toLowerCase().trim();
   console.log('[' + phone + '] (' + c.estado + '): ' + texto);
 
-  // CONSULTA DE CITA
+  // CONSULTA DE CITA — muestra botones para actuar
   if (c.nombre && esPreguntaCita(t)) {
     const cita = await getCitaActivaGoogle(c.nombre);
     if (cita) {
       const fecha = formatFecha(cita);
-      await sendText(phone,
-        'Tu proxima cita con la Dra. Rosina es el *' + fecha + '* 📅\nPara cualquier cambio contacta al consultorio.'
+      c.estado = E.CA;
+      await sendButtons(phone,
+        'Tu proxima cita con la Dra. Rosina es el *' + fecha + '* 📅\n\n¿Que quieres hacer?',
+        ['🔄 Cancelar y reagendar', '✅ Ok, gracias']
       );
     } else {
       await sendText(phone, 'No encontre citas proximas, ' + c.nombre + '. ¿Quieres agendar una? 😊');
@@ -392,7 +414,7 @@ async function handle(phone, texto) {
     if (esSi(t)) {
       c.correo = c.correoTemp;
       c.correoTemp = null;
-      guardarCliente(c);
+      await guardarCliente(c);
       c.estado = E.S;
       await sendList(phone, '¡Listo, ' + c.nombre + '! Ya tengo todos tus datos 🎉 ¿Que servicio te interesa hoy?', SERVICIOS);
     } else if (esNo(t)) {
@@ -433,7 +455,6 @@ async function handle(phone, texto) {
     if (esSi(t) || t.includes('agend')) {
       const citaActiva = await getCitaActivaGoogle(c.nombre);
       if (citaActiva) {
-        c.citaPendiente = citaActiva.id;
         c.estado = E.CA;
         const fecha = formatFecha(citaActiva);
         await sendButtons(phone,
@@ -442,7 +463,7 @@ async function handle(phone, texto) {
         );
       } else {
         c.ultimoSrv = c.srvPendiente;
-        guardarCliente(c);
+        await guardarCliente(c);
         c.estado = E.L;
         const link = agendaLink(c, c.srvPendiente);
         await sendText(phone,
@@ -456,32 +477,36 @@ async function handle(phone, texto) {
     return;
   }
 
-  // CANCELACION
+  // CANCELACION — busca la cita de nuevo en Google Calendar
   if (c.estado === E.CA) {
     if (esSi(t) || t.includes('cancel') || t.includes('reagend')) {
-      const ok = await cancelarCitaGoogle(c.citaPendiente);
-      c.citaPendiente = null;
-      if (ok) {
-        c.ultimoSrv = c.srvPendiente;
-        guardarCliente(c);
-        c.estado = E.L;
-        const link = agendaLink(c, c.srvPendiente);
-        await sendText(phone, 'Listo, cancele tu cita anterior ✅\n\nAhora elige tu nuevo horario:\n\n📅 ' + link);
-        c.srvPendiente = null;
+      const cita = await getCitaActivaGoogle(c.nombre);
+      if (cita) {
+        const ok = await cancelarCitaGoogle(cita.id);
+        if (ok) {
+          c.estado = E.S;
+          await sendList(phone,
+            'Listo, cancele tu cita ✅ ¿Que servicio quieres agendar ahora?',
+            SERVICIOS
+          );
+        } else {
+          c.estado = E.L;
+          await sendText(phone, 'Hubo un problema al cancelar tu cita 😔 Por favor contacta directamente al consultorio.');
+        }
       } else {
         c.estado = E.L;
-        await sendText(phone, 'Hubo un problema al cancelar tu cita 😔 Por favor contacta directamente al consultorio.');
+        await sendText(phone, 'No encontre ninguna cita activa para cancelar 😊');
       }
       return;
     }
-    if (esNo(t) || t.includes('dejar') || t.includes('asi')) {
-      c.citaPendiente = null;
-      c.srvPendiente  = null;
+
+    if (esNo(t) || t.includes('dejar') || t.includes('asi') || t.includes('gracias')) {
       c.estado = E.L;
       await sendText(phone, '¡Perfecto, tu cita sigue igual! 😊 ¿En que mas te puedo ayudar?');
       return;
     }
-    await sendButtons(phone, '¿Que quieres hacer con tu cita existente?', ['🔄 Cancelar y reagendar', '✅ Dejar asi']);
+
+    await sendButtons(phone, '¿Que quieres hacer con tu cita?', ['🔄 Cancelar y reagendar', '✅ Ok, gracias']);
     return;
   }
 
@@ -570,4 +595,7 @@ app.get('/', (req, res) => res.json({
   clientes: Object.keys(sesiones).length
 }));
 
-app.listen(PORT, () => console.log('Bon corriendo en puerto ' + PORT));
+// ─── INICIO ────────────────────────────────────────────────────────
+initDB().then(() => {
+  app.listen(PORT, () => console.log('Bon corriendo en puerto ' + PORT));
+});
