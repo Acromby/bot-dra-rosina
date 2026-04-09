@@ -16,12 +16,22 @@ const DATABASE_URL         = process.env.DATABASE_URL;
 const PORT                 = process.env.PORT || 3000;
 const AGENDA_BASE          = 'https://calendly.com/melissavargass16/dra-rosina';
 
+// Nombres completos para lógica interna
 const SERVICIOS = [
   'Botox / Toxina botulinica',
   'Rellenos de acido hialuronico',
   'Limpieza facial',
   'Tratamientos laser',
   'Mesoterapia'
+];
+
+// Nombres cortos para la lista de WhatsApp (max 24 chars)
+const SERVICIOS_LISTA = [
+  { id: 'srv_0', title: 'Botox / Toxina', desc: 'Toxina botulinica' },
+  { id: 'srv_1', title: 'Rellenos hialuronico', desc: 'Acido hialuronico' },
+  { id: 'srv_2', title: 'Limpieza facial', desc: 'Limpieza facial' },
+  { id: 'srv_3', title: 'Tratamientos laser', desc: 'Laser' },
+  { id: 'srv_4', title: 'Mesoterapia', desc: 'Mesoterapia' }
 ];
 
 const RELACIONADOS = {
@@ -65,19 +75,14 @@ async function initDB() {
       )
     `);
     console.log('DB lista');
-  } catch(e) {
-    console.error('initDB:', e.message);
-  }
+  } catch(e) { console.error('initDB:', e.message); }
 }
 
 async function getClienteDB(phone) {
   try {
     const res = await pool.query('SELECT * FROM clientes WHERE phone = $1', [phone]);
     return res.rows[0] || null;
-  } catch(e) {
-    console.error('getClienteDB:', e.message);
-    return null;
-  }
+  } catch(e) { console.error('getClienteDB:', e.message); return null; }
 }
 
 async function saveClienteDB(phone, nombre, correo, ultimoSrv) {
@@ -88,12 +93,10 @@ async function saveClienteDB(phone, nombre, correo, ultimoSrv) {
       ON CONFLICT (phone) DO UPDATE
       SET nombre = $2, correo = $3, ultimo_srv = $4, actualizado_at = NOW()
     `, [phone, nombre, correo, ultimoSrv]);
-  } catch(e) {
-    console.error('saveClienteDB:', e.message);
-  }
+  } catch(e) { console.error('saveClienteDB:', e.message); }
 }
 
-// ─── SESIONES EN MEMORIA (solo estado de conversacion) ─────────────
+// ─── SESIONES ──────────────────────────────────────────────────────
 const sesiones = {};
 
 async function getCliente(phone) {
@@ -101,14 +104,14 @@ async function getCliente(phone) {
     const guardado = await getClienteDB(phone);
     sesiones[phone] = {
       phone,
-      nombre:        guardado?.nombre     || null,
-      correo:        guardado?.correo     || null,
-      ultimoSrv:     guardado?.ultimo_srv || null,
-      estado:        E.I,
-      nombreTemp:    null,
-      correoTemp:    null,
-      srvPendiente:  null,
-      retSet:        false,
+      nombre:       guardado?.nombre     || null,
+      correo:       guardado?.correo     || null,
+      ultimoSrv:    guardado?.ultimo_srv || null,
+      estado:       E.I,
+      nombreTemp:   null,
+      correoTemp:   null,
+      srvPendiente: null,
+      retSet:       false,
     };
   }
   return sesiones[phone];
@@ -122,7 +125,7 @@ function capitalizarNombre(str) {
   return str.trim().replace(/\b\w/g, l => l.toUpperCase());
 }
 
-// ─── GOOGLE SERVICE ACCOUNT JWT ────────────────────────────────────
+// ─── GOOGLE SERVICE ACCOUNT ────────────────────────────────────────
 let googleAccessToken = null;
 let googleTokenExpiry = 0;
 
@@ -132,9 +135,7 @@ function base64url(str) {
 }
 
 async function getGoogleToken() {
-  if (googleAccessToken && Date.now() < googleTokenExpiry - 60000) {
-    return googleAccessToken;
-  }
+  if (googleAccessToken && Date.now() < googleTokenExpiry - 60000) return googleAccessToken;
   try {
     const now = Math.floor(Date.now() / 1000);
     const header  = base64url(JSON.stringify({ alg: 'RS256', typ: 'JWT' }));
@@ -142,17 +143,15 @@ async function getGoogleToken() {
       iss: GOOGLE_SERVICE_EMAIL,
       scope: 'https://www.googleapis.com/auth/calendar',
       aud: 'https://oauth2.googleapis.com/token',
-      exp: now + 3600,
-      iat: now
+      exp: now + 3600, iat: now
     }));
     const sign = crypto.createSign('RSA-SHA256');
     sign.update(header + '.' + payload);
-    const signature = sign.sign(GOOGLE_PRIVATE_KEY, 'base64')
+    const sig = sign.sign(GOOGLE_PRIVATE_KEY, 'base64')
       .replace(/\+/g, '-').replace(/\//g, '_').replace(/=/g, '');
-    const jwt = header + '.' + payload + '.' + signature;
     const res = await axios.post('https://oauth2.googleapis.com/token', {
       grant_type: 'urn:ietf:params:oauth:grant-type:jwt-bearer',
-      assertion: jwt
+      assertion: header + '.' + payload + '.' + sig
     });
     googleAccessToken = res.data.access_token;
     googleTokenExpiry = Date.now() + (res.data.expires_in * 1000);
@@ -164,26 +163,22 @@ async function getGoogleToken() {
   }
 }
 
-// ─── GOOGLE CALENDAR ───────────────────────────────────────────────
 async function getCitaActivaGoogle(nombre) {
   try {
     const token = await getGoogleToken();
     if (!token) return null;
-    const ahora = new Date().toISOString();
     const res = await axios.get(
       'https://www.googleapis.com/calendar/v3/calendars/' + encodeURIComponent(GOOGLE_CALENDAR_ID) + '/events',
       {
         headers: { Authorization: 'Bearer ' + token },
-        params: { timeMin: ahora, singleEvents: true, orderBy: 'startTime', maxResults: 50 }
+        params: { timeMin: new Date().toISOString(), singleEvents: true, orderBy: 'startTime', maxResults: 50 }
       }
     );
-    const eventos = res.data.items || [];
     const nombreLower = nombre.toLowerCase().split(' ')[0];
-    const cita = eventos.find(ev => {
-      const titulo = (ev.summary || '').toLowerCase();
-      const desc   = (ev.description || '').toLowerCase();
-      return titulo.includes(nombreLower) || desc.includes(nombreLower);
-    });
+    const cita = (res.data.items || []).find(ev =>
+      (ev.summary || '').toLowerCase().includes(nombreLower) ||
+      (ev.description || '').toLowerCase().includes(nombreLower)
+    );
     console.log('Cita encontrada:', cita ? cita.summary : 'ninguna');
     return cita || null;
   } catch(e) {
@@ -217,7 +212,6 @@ function formatFecha(evento) {
   });
 }
 
-// ─── CALENDLY LINK ─────────────────────────────────────────────────
 function agendaLink(c, srv) {
   const params = new URLSearchParams();
   if (c.nombre) params.set('name', c.nombre);
@@ -237,7 +231,7 @@ async function sendText(to, text) {
   } catch(e) { console.error('sendText:', e.response?.data || e.message); }
 }
 
-async function sendList(to, bodyText, items) {
+async function sendList(to, bodyText) {
   try {
     await axios.post(
       'https://graph.facebook.com/v18.0/' + PHONE_NUMBER_ID + '/messages',
@@ -250,10 +244,10 @@ async function sendList(to, bodyText, items) {
             button: 'Ver servicios 💆‍♀️',
             sections: [{
               title: 'Servicios disponibles',
-              rows: items.map((item, i) => ({
-                id: 'srv_' + i,
-                title: item.slice(0, 24),
-                description: 'Selecciona para agendar'
+              rows: SERVICIOS_LISTA.map(s => ({
+                id: s.id,
+                title: s.title,
+                description: s.desc
               }))
             }]
           }
@@ -263,7 +257,7 @@ async function sendList(to, bodyText, items) {
     );
   } catch(e) {
     console.error('sendList error:', e.response?.data || e.message);
-    await sendText(to, bodyText + '\n\n' + items.map((s,i) => (i+1)+'. '+s).join('\n'));
+    await sendText(to, bodyText + '\n\n' + SERVICIOS.map((s,i) => (i+1)+'. '+s).join('\n'));
   }
 }
 
@@ -299,6 +293,12 @@ function detSrv(t) {
   if (s.includes('limpieza'))                        return SERVICIOS[2];
   if (s.includes('laser') || s.includes('láser'))    return SERVICIOS[3];
   if (s.includes('mesoterapia'))                     return SERVICIOS[4];
+  // por id de lista
+  if (s === 'botox / toxina')        return SERVICIOS[0];
+  if (s === 'rellenos hialuronico')  return SERVICIOS[1];
+  if (s === 'limpieza facial')       return SERVICIOS[2];
+  if (s === 'tratamientos laser')    return SERVICIOS[3];
+  if (s === 'mesoterapia')           return SERVICIOS[4];
   if (/\b1\b/.test(s)) return SERVICIOS[0];
   if (/\b2\b/.test(s)) return SERVICIOS[1];
   if (/\b3\b/.test(s)) return SERVICIOS[2];
@@ -307,9 +307,7 @@ function detSrv(t) {
   return null;
 }
 
-function esValidoEmail(email) {
-  return /^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(email);
-}
+function esValidoEmail(e) { return /^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(e); }
 
 function esPreguntaCita(t) {
   const s = t.toLowerCase();
@@ -317,13 +315,8 @@ function esPreguntaCita(t) {
          (s.includes('cita') || s.includes('reserv') || s.includes('agendar'));
 }
 
-function esSi(t) {
-  return t.includes('si') || t.includes('sí') || t.includes('yes') || t.includes('correcto') || t.includes('exacto');
-}
-
-function esNo(t) {
-  return t.includes('no') || t.includes('corregir') || t.includes('mal') || t.includes('error');
-}
+function esSi(t) { return t.includes('si') || t.includes('sí') || t.includes('yes') || t.includes('correcto') || t.includes('exacto'); }
+function esNo(t) { return t.includes('no') || t.includes('corregir') || t.includes('mal') || t.includes('error'); }
 
 // ─── FLUJO ─────────────────────────────────────────────────────────
 async function handle(phone, texto) {
@@ -331,15 +324,14 @@ async function handle(phone, texto) {
   const t = (texto || '').toLowerCase().trim();
   console.log('[' + phone + '] (' + c.estado + '): ' + texto);
 
-  // CONSULTA DE CITA — muestra botones para actuar
+  // CONSULTA DE CITA
   if (c.nombre && esPreguntaCita(t)) {
     const cita = await getCitaActivaGoogle(c.nombre);
     if (cita) {
-      const fecha = formatFecha(cita);
       c.estado = E.CA;
       await sendButtons(phone,
-        'Tu proxima cita con la Dra. Rosina es el *' + fecha + '* 📅\n\n¿Que quieres hacer?',
-        ['🔄 Cancelar y reagendar', '✅ Ok, gracias']
+        'Tu proxima cita con la Dra. Rosina es el *' + formatFecha(cita) + '* 📅\n\n¿Que quieres hacer?',
+        ['🔄 Cancelar y reagendar', '❌ Cancelar cita', '✅ Ok, gracias']
       );
     } else {
       await sendText(phone, 'No encontre citas proximas, ' + c.nombre + '. ¿Quieres agendar una? 😊');
@@ -351,7 +343,7 @@ async function handle(phone, texto) {
   if (c.estado === E.I) {
     if (c.nombre && c.correo) {
       c.estado = E.S;
-      await sendList(phone, '¡Hola de nuevo, ' + c.nombre + '! Que gusto saludarte 😊 ¿En que te podemos ayudar hoy?', SERVICIOS);
+      await sendList(phone, '¡Hola de nuevo, ' + c.nombre + '! Que gusto saludarte 😊 ¿En que te podemos ayudar hoy?');
     } else if (c.nombre && !c.correo) {
       c.estado = E.C;
       await sendText(phone, '¡Hola ' + c.nombre + '! Para completar tu registro necesito tu correo electronico, ¿me lo compartes?');
@@ -416,7 +408,7 @@ async function handle(phone, texto) {
       c.correoTemp = null;
       await guardarCliente(c);
       c.estado = E.S;
-      await sendList(phone, '¡Listo, ' + c.nombre + '! Ya tengo todos tus datos 🎉 ¿Que servicio te interesa hoy?', SERVICIOS);
+      await sendList(phone, '¡Listo, ' + c.nombre + '! Ya tengo todos tus datos 🎉 ¿Que servicio te interesa hoy?');
     } else if (esNo(t)) {
       c.correoTemp = null;
       c.estado = E.C;
@@ -430,7 +422,7 @@ async function handle(phone, texto) {
   // SERVICIO
   if (c.estado === E.S) {
     if (t.includes('servicios') || t.includes('ver')) {
-      await sendList(phone, 'Estos son nuestros servicios:', SERVICIOS);
+      await sendList(phone, 'Estos son nuestros servicios:');
       return;
     }
     const srv = detSrv(texto);
@@ -439,7 +431,7 @@ async function handle(phone, texto) {
       c.estado = E.CF;
       await sendButtons(phone, '¿Te agendo una cita de *' + srv + '*, ' + c.nombre + '? 💆‍♀️', ['✅ Si, agendame', '❌ Ver otros servicios']);
     } else {
-      await sendList(phone, '¿Cual servicio te interesa, ' + c.nombre + '?', SERVICIOS);
+      await sendList(phone, '¿Cual servicio te interesa, ' + c.nombre + '?');
     }
     return;
   }
@@ -449,17 +441,16 @@ async function handle(phone, texto) {
     if (esNo(t) || t.includes('ver otros') || t.includes('otros')) {
       c.estado = E.S;
       c.srvPendiente = null;
-      await sendList(phone, '¡Claro! ¿Cual servicio prefieres?', SERVICIOS);
+      await sendList(phone, '¡Claro! ¿Cual servicio prefieres?');
       return;
     }
     if (esSi(t) || t.includes('agend')) {
       const citaActiva = await getCitaActivaGoogle(c.nombre);
       if (citaActiva) {
         c.estado = E.CA;
-        const fecha = formatFecha(citaActiva);
         await sendButtons(phone,
-          'Ya tienes una cita agendada el *' + fecha + '* 📅\n\n¿Que quieres hacer?',
-          ['🔄 Cancelar y reagendar', '✅ Dejar asi']
+          'Ya tienes una cita agendada el *' + formatFecha(citaActiva) + '* 📅\n\n¿Que quieres hacer?',
+          ['🔄 Cancelar y reagendar', '❌ Cancelar cita', '✅ Dejar asi']
         );
       } else {
         c.ultimoSrv = c.srvPendiente;
@@ -477,36 +468,49 @@ async function handle(phone, texto) {
     return;
   }
 
-  // CANCELACION — busca la cita de nuevo en Google Calendar
+  // CANCELACION
   if (c.estado === E.CA) {
-    if (esSi(t) || t.includes('cancel') || t.includes('reagend')) {
+    const esCancelarReagendar = t.includes('cancelar y reagendar') || t.includes('reagendar');
+    const esSoloCancelar = t.includes('cancelar cita') || t.includes('solo cancelar');
+    const esDejar = t.includes('dejar') || t.includes('gracias') || t.includes('ok');
+
+    if (esCancelarReagendar) {
       const cita = await getCitaActivaGoogle(c.nombre);
       if (cita) {
         const ok = await cancelarCitaGoogle(cita.id);
         if (ok) {
           c.estado = E.S;
-          await sendList(phone,
-            'Listo, cancele tu cita ✅ ¿Que servicio quieres agendar ahora?',
-            SERVICIOS
-          );
+          await sendList(phone, 'Listo, cancele tu cita ✅ ¿Que servicio quieres agendar ahora?');
         } else {
           c.estado = E.L;
-          await sendText(phone, 'Hubo un problema al cancelar tu cita 😔 Por favor contacta directamente al consultorio.');
+          await sendText(phone, 'Hubo un problema al cancelar 😔 Por favor contacta directamente al consultorio.');
         }
-      } else {
-        c.estado = E.L;
-        await sendText(phone, 'No encontre ninguna cita activa para cancelar 😊');
       }
       return;
     }
 
-    if (esNo(t) || t.includes('dejar') || t.includes('asi') || t.includes('gracias')) {
+    if (esSoloCancelar) {
+      const cita = await getCitaActivaGoogle(c.nombre);
+      if (cita) {
+        const ok = await cancelarCitaGoogle(cita.id);
+        if (ok) {
+          c.estado = E.L;
+          await sendText(phone, 'Listo, tu cita ha sido cancelada ✅ Si en algun momento quieres agendar de nuevo, aqui estoy 😊');
+        } else {
+          c.estado = E.L;
+          await sendText(phone, 'Hubo un problema al cancelar 😔 Por favor contacta directamente al consultorio.');
+        }
+      }
+      return;
+    }
+
+    if (esDejar) {
       c.estado = E.L;
       await sendText(phone, '¡Perfecto, tu cita sigue igual! 😊 ¿En que mas te puedo ayudar?');
       return;
     }
 
-    await sendButtons(phone, '¿Que quieres hacer con tu cita?', ['🔄 Cancelar y reagendar', '✅ Ok, gracias']);
+    await sendButtons(phone, '¿Que quieres hacer con tu cita?', ['🔄 Cancelar y reagendar', '❌ Cancelar cita', '✅ Ok, gracias']);
     return;
   }
 
@@ -514,7 +518,7 @@ async function handle(phone, texto) {
   if (c.estado === E.L) {
     if (t.includes('agendar') || t.includes('reservar') || t.includes('nueva cita') || t.includes('otro servicio')) {
       c.estado = E.S;
-      await sendList(phone, '¡Claro! ¿Que servicio quieres esta vez?', SERVICIOS);
+      await sendList(phone, '¡Claro! ¿Que servicio quieres esta vez?');
       return;
     }
     if (t.includes('gracias') || t.includes('listo') || t.includes('ya agende') || t.includes('ya lo hice')) {
