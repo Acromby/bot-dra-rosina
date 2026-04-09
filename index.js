@@ -2,20 +2,20 @@ const express = require('express');
 const axios = require('axios');
 const fs = require('fs');
 const path = require('path');
+const crypto = require('crypto');
 const app = express();
 app.use(express.json());
 
-const VERIFY_TOKEN    = process.env.VERIFY_TOKEN || 'dra-rosina-2024';
-const WHATSAPP_TOKEN  = process.env.WHATSAPP_TOKEN;
-const PHONE_NUMBER_ID = process.env.PHONE_NUMBER_ID;
-const ANTHROPIC_KEY   = process.env.ANTHROPIC_API_KEY;
-const GOOGLE_CLIENT_ID     = process.env.GOOGLE_CLIENT_ID;
-const GOOGLE_CLIENT_SECRET = process.env.GOOGLE_CLIENT_SECRET;
-const GOOGLE_REFRESH_TOKEN = process.env.GOOGLE_REFRESH_TOKEN;
-const PORT            = process.env.PORT || 3000;
-const AGENDA_BASE     = 'https://calendly.com/melissavargass16/dra-rosina';
-const CALENDAR_ID     = 'primary';
-const DB_PATH         = path.join('/tmp', 'clientes.json');
+const VERIFY_TOKEN         = process.env.VERIFY_TOKEN || 'dra-rosina-2024';
+const WHATSAPP_TOKEN       = process.env.WHATSAPP_TOKEN;
+const PHONE_NUMBER_ID      = process.env.PHONE_NUMBER_ID;
+const ANTHROPIC_KEY        = process.env.ANTHROPIC_API_KEY;
+const GOOGLE_SERVICE_EMAIL = process.env.GOOGLE_SERVICE_EMAIL;
+const GOOGLE_PRIVATE_KEY   = (process.env.GOOGLE_PRIVATE_KEY || '').replace(/\\n/g, '\n');
+const GOOGLE_CALENDAR_ID   = process.env.GOOGLE_CALENDAR_ID || 'melissavargass16@gmail.com';
+const PORT                 = process.env.PORT || 3000;
+const AGENDA_BASE          = 'https://calendly.com/melissavargass16/dra-rosina';
+const DB_PATH              = path.join('/tmp', 'clientes.json');
 
 const SERVICIOS = [
   'Botox / Toxina botulinica',
@@ -92,23 +92,45 @@ function capitalizarNombre(str) {
   return str.trim().replace(/\b\w/g, l => l.toUpperCase());
 }
 
-// ─── GOOGLE CALENDAR ───────────────────────────────────────────────
+// ─── GOOGLE SERVICE ACCOUNT JWT ────────────────────────────────────
 let googleAccessToken = null;
 let googleTokenExpiry = 0;
+
+function base64url(str) {
+  return Buffer.from(str).toString('base64')
+    .replace(/\+/g, '-').replace(/\//g, '_').replace(/=/g, '');
+}
 
 async function getGoogleToken() {
   if (googleAccessToken && Date.now() < googleTokenExpiry - 60000) {
     return googleAccessToken;
   }
   try {
+    const now = Math.floor(Date.now() / 1000);
+    const header = base64url(JSON.stringify({ alg: 'RS256', typ: 'JWT' }));
+    const payload = base64url(JSON.stringify({
+      iss: GOOGLE_SERVICE_EMAIL,
+      scope: 'https://www.googleapis.com/auth/calendar',
+      aud: 'https://oauth2.googleapis.com/token',
+      exp: now + 3600,
+      iat: now
+    }));
+
+    const sign = crypto.createSign('RSA-SHA256');
+    sign.update(header + '.' + payload);
+    const signature = sign.sign(GOOGLE_PRIVATE_KEY, 'base64')
+      .replace(/\+/g, '-').replace(/\//g, '_').replace(/=/g, '');
+
+    const jwt = header + '.' + payload + '.' + signature;
+
     const res = await axios.post('https://oauth2.googleapis.com/token', {
-      client_id:     GOOGLE_CLIENT_ID,
-      client_secret: GOOGLE_CLIENT_SECRET,
-      refresh_token: GOOGLE_REFRESH_TOKEN,
-      grant_type:    'refresh_token'
+      grant_type: 'urn:ietf:params:oauth:grant-type:jwt-bearer',
+      assertion: jwt
     });
+
     googleAccessToken = res.data.access_token;
     googleTokenExpiry = Date.now() + (res.data.expires_in * 1000);
+    console.log('Google token OK');
     return googleAccessToken;
   } catch(e) {
     console.error('getGoogleToken:', e.response?.data || e.message);
@@ -116,13 +138,14 @@ async function getGoogleToken() {
   }
 }
 
-async function getCitaActivaGoogle(nombre, correo) {
+// ─── GOOGLE CALENDAR ───────────────────────────────────────────────
+async function getCitaActivaGoogle(nombre) {
   try {
     const token = await getGoogleToken();
     if (!token) return null;
     const ahora = new Date().toISOString();
     const res = await axios.get(
-      'https://www.googleapis.com/calendar/v3/calendars/' + encodeURIComponent(CALENDAR_ID) + '/events',
+      'https://www.googleapis.com/calendar/v3/calendars/' + encodeURIComponent(GOOGLE_CALENDAR_ID) + '/events',
       {
         headers: { Authorization: 'Bearer ' + token },
         params: {
@@ -134,17 +157,14 @@ async function getCitaActivaGoogle(nombre, correo) {
       }
     );
     const eventos = res.data.items || [];
-    // Buscar evento que contenga el nombre o correo del cliente
-    const nombreLower = nombre ? nombre.toLowerCase() : '';
-    const correoLower = correo ? correo.toLowerCase() : '';
+    console.log('Eventos encontrados:', eventos.length);
+    const nombreLower = nombre.toLowerCase().split(' ')[0];
     const cita = eventos.find(ev => {
       const titulo = (ev.summary || '').toLowerCase();
       const desc   = (ev.description || '').toLowerCase();
-      const attendees = (ev.attendees || []).map(a => a.email.toLowerCase());
-      return titulo.includes(nombreLower.split(' ')[0]) ||
-             desc.includes(nombreLower.split(' ')[0]) ||
-             attendees.includes(correoLower);
+      return titulo.includes(nombreLower) || desc.includes(nombreLower);
     });
+    console.log('Cita encontrada:', cita ? cita.summary : 'ninguna');
     return cita || null;
   } catch(e) {
     console.error('getCitaActivaGoogle:', e.response?.data || e.message);
@@ -157,7 +177,7 @@ async function cancelarCitaGoogle(eventId) {
     const token = await getGoogleToken();
     if (!token) return false;
     await axios.delete(
-      'https://www.googleapis.com/calendar/v3/calendars/' + encodeURIComponent(CALENDAR_ID) + '/events/' + eventId,
+      'https://www.googleapis.com/calendar/v3/calendars/' + encodeURIComponent(GOOGLE_CALENDAR_ID) + '/events/' + eventId,
       { headers: { Authorization: 'Bearer ' + token } }
     );
     return true;
@@ -170,8 +190,7 @@ async function cancelarCitaGoogle(eventId) {
 function formatFecha(evento) {
   const inicio = evento.start?.dateTime || evento.start?.date;
   if (!inicio) return 'fecha desconocida';
-  const fecha = new Date(inicio);
-  return fecha.toLocaleDateString('es-MX', {
+  return new Date(inicio).toLocaleDateString('es-MX', {
     timeZone: 'America/Matamoros',
     weekday: 'long', year: 'numeric', month: 'long',
     day: 'numeric', hour: '2-digit', minute: '2-digit', hour12: true
@@ -292,18 +311,16 @@ async function handle(phone, texto) {
   const t = (texto || '').toLowerCase().trim();
   console.log('[' + phone + '] (' + c.estado + '): ' + texto);
 
-  // CONSULTA DE CITA — cualquier estado
+  // CONSULTA DE CITA
   if (c.nombre && esPreguntaCita(t)) {
-    const cita = await getCitaActivaGoogle(c.nombre, c.correo);
+    const cita = await getCitaActivaGoogle(c.nombre);
     if (cita) {
       const fecha = formatFecha(cita);
       await sendText(phone,
-        'Tu proxima cita con la Dra. Rosina es el *' + fecha + '* 📅\n' +
-        (cita.summary ? 'Servicio: ' + cita.summary + '\n' : '') +
-        'Para cualquier cambio contacta al consultorio.'
+        'Tu proxima cita con la Dra. Rosina es el *' + fecha + '* 📅\nPara cualquier cambio contacta al consultorio.'
       );
     } else {
-      await sendText(phone, 'No encontre citas proximas, ' + c.nombre + '. ¿Quieres agendar una? 📅');
+      await sendText(phone, 'No encontre citas proximas, ' + c.nombre + '. ¿Quieres agendar una? 😊');
     }
     return;
   }
@@ -312,10 +329,7 @@ async function handle(phone, texto) {
   if (c.estado === E.I) {
     if (c.nombre && c.correo) {
       c.estado = E.S;
-      await sendList(phone,
-        '¡Hola de nuevo, ' + c.nombre + '! Que gusto saludarte 😊 ¿En que te podemos ayudar hoy?',
-        SERVICIOS
-      );
+      await sendList(phone, '¡Hola de nuevo, ' + c.nombre + '! Que gusto saludarte 😊 ¿En que te podemos ayudar hoy?', SERVICIOS);
     } else if (c.nombre && !c.correo) {
       c.estado = E.C;
       await sendText(phone, '¡Hola ' + c.nombre + '! Para completar tu registro necesito tu correo electronico, ¿me lo compartes?');
@@ -336,10 +350,7 @@ async function handle(phone, texto) {
     if (m) {
       c.nombreTemp = capitalizarNombre(m[1] + ' ' + m[2]);
       c.estado = E.CN;
-      await sendButtons(phone,
-        '¿Tu nombre es *' + c.nombreTemp + '*? ✍️',
-        ['✅ Si, es correcto', '❌ Corregir']
-      );
+      await sendButtons(phone, '¿Tu nombre es *' + c.nombreTemp + '*? ✍️', ['✅ Si, es correcto', '❌ Corregir']);
     } else {
       await sendText(phone, 'Necesito tu nombre y apellido completos. ¿Me los regalas?');
     }
@@ -358,10 +369,7 @@ async function handle(phone, texto) {
       c.estado = E.N;
       await sendText(phone, 'Sin problema, ¿me vuelves a decir tu nombre y apellido?');
     } else {
-      await sendButtons(phone,
-        '¿Tu nombre es *' + c.nombreTemp + '*?',
-        ['✅ Si, es correcto', '❌ Corregir']
-      );
+      await sendButtons(phone, '¿Tu nombre es *' + c.nombreTemp + '*?', ['✅ Si, es correcto', '❌ Corregir']);
     }
     return;
   }
@@ -372,10 +380,7 @@ async function handle(phone, texto) {
     if (esValidoEmail(emailLimpio)) {
       c.correoTemp = emailLimpio;
       c.estado = E.CC;
-      await sendButtons(phone,
-        '¿Tu correo es *' + c.correoTemp + '*? 📧',
-        ['✅ Si, es correcto', '❌ Corregir']
-      );
+      await sendButtons(phone, '¿Tu correo es *' + c.correoTemp + '*? 📧', ['✅ Si, es correcto', '❌ Corregir']);
     } else {
       await sendText(phone, 'Ese correo no parece valido 😊 ¿Me lo escribes de nuevo? Ejemplo: nombre@gmail.com');
     }
@@ -389,19 +394,13 @@ async function handle(phone, texto) {
       c.correoTemp = null;
       guardarCliente(c);
       c.estado = E.S;
-      await sendList(phone,
-        '¡Listo, ' + c.nombre + '! Ya tengo todos tus datos 🎉 ¿Que servicio te interesa hoy?',
-        SERVICIOS
-      );
+      await sendList(phone, '¡Listo, ' + c.nombre + '! Ya tengo todos tus datos 🎉 ¿Que servicio te interesa hoy?', SERVICIOS);
     } else if (esNo(t)) {
       c.correoTemp = null;
       c.estado = E.C;
       await sendText(phone, 'Sin problema, ¿me vuelves a escribir tu correo electronico?');
     } else {
-      await sendButtons(phone,
-        '¿Tu correo es *' + c.correoTemp + '*?',
-        ['✅ Si, es correcto', '❌ Corregir']
-      );
+      await sendButtons(phone, '¿Tu correo es *' + c.correoTemp + '*?', ['✅ Si, es correcto', '❌ Corregir']);
     }
     return;
   }
@@ -416,10 +415,7 @@ async function handle(phone, texto) {
     if (srv) {
       c.srvPendiente = srv;
       c.estado = E.CF;
-      await sendButtons(phone,
-        '¿Te agendo una cita de *' + srv + '*, ' + c.nombre + '? 💆‍♀️',
-        ['✅ Si, agendame', '❌ Ver otros servicios']
-      );
+      await sendButtons(phone, '¿Te agendo una cita de *' + srv + '*, ' + c.nombre + '? 💆‍♀️', ['✅ Si, agendame', '❌ Ver otros servicios']);
     } else {
       await sendList(phone, '¿Cual servicio te interesa, ' + c.nombre + '?', SERVICIOS);
     }
@@ -434,9 +430,8 @@ async function handle(phone, texto) {
       await sendList(phone, '¡Claro! ¿Cual servicio prefieres?', SERVICIOS);
       return;
     }
-
     if (esSi(t) || t.includes('agend')) {
-      const citaActiva = await getCitaActivaGoogle(c.nombre, c.correo);
+      const citaActiva = await getCitaActivaGoogle(c.nombre);
       if (citaActiva) {
         c.citaPendiente = citaActiva.id;
         c.estado = E.CA;
@@ -457,11 +452,7 @@ async function handle(phone, texto) {
       }
       return;
     }
-
-    await sendButtons(phone,
-      '¿Te agendo la cita de *' + c.srvPendiente + '*?',
-      ['✅ Si, agendame', '❌ Ver otros servicios']
-    );
+    await sendButtons(phone, '¿Te agendo la cita de *' + c.srvPendiente + '*?', ['✅ Si, agendame', '❌ Ver otros servicios']);
     return;
   }
 
@@ -475,9 +466,7 @@ async function handle(phone, texto) {
         guardarCliente(c);
         c.estado = E.L;
         const link = agendaLink(c, c.srvPendiente);
-        await sendText(phone,
-          'Listo, cancele tu cita anterior ✅\n\nAhora elige tu nuevo horario:\n\n📅 ' + link
-        );
+        await sendText(phone, 'Listo, cancele tu cita anterior ✅\n\nAhora elige tu nuevo horario:\n\n📅 ' + link);
         c.srvPendiente = null;
       } else {
         c.estado = E.L;
@@ -485,7 +474,6 @@ async function handle(phone, texto) {
       }
       return;
     }
-
     if (esNo(t) || t.includes('dejar') || t.includes('asi')) {
       c.citaPendiente = null;
       c.srvPendiente  = null;
@@ -493,11 +481,7 @@ async function handle(phone, texto) {
       await sendText(phone, '¡Perfecto, tu cita sigue igual! 😊 ¿En que mas te puedo ayudar?');
       return;
     }
-
-    await sendButtons(phone,
-      '¿Que quieres hacer con tu cita existente?',
-      ['🔄 Cancelar y reagendar', '✅ Dejar asi']
-    );
+    await sendButtons(phone, '¿Que quieres hacer con tu cita existente?', ['🔄 Cancelar y reagendar', '✅ Dejar asi']);
     return;
   }
 
