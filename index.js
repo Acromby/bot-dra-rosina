@@ -9,10 +9,12 @@ const VERIFY_TOKEN    = process.env.VERIFY_TOKEN || 'dra-rosina-2024';
 const WHATSAPP_TOKEN  = process.env.WHATSAPP_TOKEN;
 const PHONE_NUMBER_ID = process.env.PHONE_NUMBER_ID;
 const ANTHROPIC_KEY   = process.env.ANTHROPIC_API_KEY;
-const CALENDLY_TOKEN  = process.env.CALENDLY_TOKEN;
+const GOOGLE_CLIENT_ID     = process.env.GOOGLE_CLIENT_ID;
+const GOOGLE_CLIENT_SECRET = process.env.GOOGLE_CLIENT_SECRET;
+const GOOGLE_REFRESH_TOKEN = process.env.GOOGLE_REFRESH_TOKEN;
 const PORT            = process.env.PORT || 3000;
 const AGENDA_BASE     = 'https://calendly.com/melissavargass16/dra-rosina';
-const CALENDLY_USER   = 'https://api.calendly.com/users/87bb5c4b-e72c-4fa4-a170-56ae1fbbe967';
+const CALENDAR_ID     = 'primary';
 const DB_PATH         = path.join('/tmp', 'clientes.json');
 
 const SERVICIOS = [
@@ -34,15 +36,15 @@ const RELACIONADOS = {
 const SYS = 'Eres Bon, asistente femenina del Consultorio de la Dra. Rosina. Responde en espanol de Mexico, tono calido, amable y cercano. Max 3 oraciones. Nunca digas que eres IA o bot. Usa el historial del cliente naturalmente.';
 
 const E = {
-  I:   'inicio',
-  N:   'nombre',
-  CN:  'confirmar_nombre',
-  C:   'correo',
-  CC:  'confirmar_correo',
-  S:   'servicio',
-  CF:  'confirmar_servicio',
-  CA:  'cancelar',
-  L:   'libre'
+  I:  'inicio',
+  N:  'nombre',
+  CN: 'confirmar_nombre',
+  C:  'correo',
+  CC: 'confirmar_correo',
+  S:  'servicio',
+  CF: 'confirmar_servicio',
+  CA: 'cancelar',
+  L:  'libre'
 };
 
 // ─── BASE DE DATOS ─────────────────────────────────────────────────
@@ -90,86 +92,99 @@ function capitalizarNombre(str) {
   return str.trim().replace(/\b\w/g, l => l.toUpperCase());
 }
 
-// ─── CALENDLY ──────────────────────────────────────────────────────
-function agendaLink(c, srv) {
-  const params = new URLSearchParams();
-  if (c.nombre) params.set('name', c.nombre);
-  if (c.correo) params.set('email', c.correo);
-  if (srv)      params.set('a1', srv);
-  return AGENDA_BASE + '?' + params.toString();
-}
+// ─── GOOGLE CALENDAR ───────────────────────────────────────────────
+let googleAccessToken = null;
+let googleTokenExpiry = 0;
 
-async function getCitaActiva(correo) {
+async function getGoogleToken() {
+  if (googleAccessToken && Date.now() < googleTokenExpiry - 60000) {
+    return googleAccessToken;
+  }
   try {
-    const ahora = new Date().toISOString();
-    const res = await axios.get('https://api.calendly.com/scheduled_events', {
-      headers: { Authorization: 'Bearer ' + CALENDLY_TOKEN },
-      params: {
-        user: CALENDLY_USER,
-        invitee_email: correo,
-        status: 'active',
-        min_start_time: ahora,
-        count: 1,
-        sort: 'start_time:asc'
-      }
+    const res = await axios.post('https://oauth2.googleapis.com/token', {
+      client_id:     GOOGLE_CLIENT_ID,
+      client_secret: GOOGLE_CLIENT_SECRET,
+      refresh_token: GOOGLE_REFRESH_TOKEN,
+      grant_type:    'refresh_token'
     });
-    const eventos = res.data.collection || [];
-    return eventos.length > 0 ? eventos[0] : null;
+    googleAccessToken = res.data.access_token;
+    googleTokenExpiry = Date.now() + (res.data.expires_in * 1000);
+    return googleAccessToken;
   } catch(e) {
-    console.error('getCitaActiva:', e.response?.data || e.message);
+    console.error('getGoogleToken:', e.response?.data || e.message);
     return null;
   }
 }
 
-async function cancelarCita(eventoUri) {
+async function getCitaActivaGoogle(nombre, correo) {
   try {
-    const uuid = eventoUri.split('/').pop();
-    await axios.post(
-      'https://api.calendly.com/scheduled_events/' + uuid + '/cancellation',
-      { reason: 'Cancelado por el cliente via WhatsApp' },
-      { headers: { Authorization: 'Bearer ' + CALENDLY_TOKEN, 'Content-Type': 'application/json' } }
+    const token = await getGoogleToken();
+    if (!token) return null;
+    const ahora = new Date().toISOString();
+    const res = await axios.get(
+      'https://www.googleapis.com/calendar/v3/calendars/' + encodeURIComponent(CALENDAR_ID) + '/events',
+      {
+        headers: { Authorization: 'Bearer ' + token },
+        params: {
+          timeMin: ahora,
+          singleEvents: true,
+          orderBy: 'startTime',
+          maxResults: 50
+        }
+      }
+    );
+    const eventos = res.data.items || [];
+    // Buscar evento que contenga el nombre o correo del cliente
+    const nombreLower = nombre ? nombre.toLowerCase() : '';
+    const correoLower = correo ? correo.toLowerCase() : '';
+    const cita = eventos.find(ev => {
+      const titulo = (ev.summary || '').toLowerCase();
+      const desc   = (ev.description || '').toLowerCase();
+      const attendees = (ev.attendees || []).map(a => a.email.toLowerCase());
+      return titulo.includes(nombreLower.split(' ')[0]) ||
+             desc.includes(nombreLower.split(' ')[0]) ||
+             attendees.includes(correoLower);
+    });
+    return cita || null;
+  } catch(e) {
+    console.error('getCitaActivaGoogle:', e.response?.data || e.message);
+    return null;
+  }
+}
+
+async function cancelarCitaGoogle(eventId) {
+  try {
+    const token = await getGoogleToken();
+    if (!token) return false;
+    await axios.delete(
+      'https://www.googleapis.com/calendar/v3/calendars/' + encodeURIComponent(CALENDAR_ID) + '/events/' + eventId,
+      { headers: { Authorization: 'Bearer ' + token } }
     );
     return true;
   } catch(e) {
-    console.error('cancelarCita:', e.response?.data || e.message);
+    console.error('cancelarCitaGoogle:', e.response?.data || e.message);
     return false;
   }
 }
 
-function formatFecha(isoString) {
-  return new Date(isoString).toLocaleDateString('es-MX', {
+function formatFecha(evento) {
+  const inicio = evento.start?.dateTime || evento.start?.date;
+  if (!inicio) return 'fecha desconocida';
+  const fecha = new Date(inicio);
+  return fecha.toLocaleDateString('es-MX', {
     timeZone: 'America/Matamoros',
     weekday: 'long', year: 'numeric', month: 'long',
     day: 'numeric', hour: '2-digit', minute: '2-digit', hour12: true
   });
 }
 
-async function getCitasPorNombre(nombre) {
-  try {
-    const ahora = new Date().toISOString();
-    const res = await axios.get('https://api.calendly.com/scheduled_events', {
-      headers: { Authorization: 'Bearer ' + CALENDLY_TOKEN },
-      params: { user: CALENDLY_USER, status: 'active', min_start_time: ahora, count: 20, sort: 'start_time:asc' }
-    });
-    const eventos = res.data.collection || [];
-    const citasDelCliente = [];
-    for (const evento of eventos) {
-      try {
-        const uuid = evento.uri.split('/').pop();
-        const invRes = await axios.get('https://api.calendly.com/scheduled_events/' + uuid + '/invitees', {
-          headers: { Authorization: 'Bearer ' + CALENDLY_TOKEN }
-        });
-        const match = (invRes.data.collection || []).find(inv =>
-          inv.name && inv.name.toLowerCase().includes(nombre.split(' ')[0].toLowerCase())
-        );
-        if (match) citasDelCliente.push({ evento, invitado: match });
-      } catch(e) { /* skip */ }
-    }
-    return citasDelCliente;
-  } catch(e) {
-    console.error('getCitasPorNombre:', e.response?.data || e.message);
-    return [];
-  }
+// ─── CALENDLY LINK ─────────────────────────────────────────────────
+function agendaLink(c, srv) {
+  const params = new URLSearchParams();
+  if (c.nombre) params.set('name', c.nombre);
+  if (c.correo) params.set('email', c.correo);
+  if (srv)      params.set('a1', srv);
+  return AGENDA_BASE + '?' + params.toString();
 }
 
 // ─── WHATSAPP ──────────────────────────────────────────────────────
@@ -279,12 +294,16 @@ async function handle(phone, texto) {
 
   // CONSULTA DE CITA — cualquier estado
   if (c.nombre && esPreguntaCita(t)) {
-    const citas = await getCitasPorNombre(c.nombre);
-    if (citas.length > 0) {
-      const fecha = formatFecha(citas[0].evento.start_time);
-      await sendText(phone, 'Tu proxima cita con la Dra. Rosina es el *' + fecha + '* 📅\nPara cualquier cambio: ' + AGENDA_BASE);
+    const cita = await getCitaActivaGoogle(c.nombre, c.correo);
+    if (cita) {
+      const fecha = formatFecha(cita);
+      await sendText(phone,
+        'Tu proxima cita con la Dra. Rosina es el *' + fecha + '* 📅\n' +
+        (cita.summary ? 'Servicio: ' + cita.summary + '\n' : '') +
+        'Para cualquier cambio contacta al consultorio.'
+      );
     } else {
-      await sendText(phone, 'No encontre citas proximas, ' + c.nombre + '. Si quieres agendar una: 📅 ' + AGENDA_BASE);
+      await sendText(phone, 'No encontre citas proximas, ' + c.nombre + '. ¿Quieres agendar una? 📅');
     }
     return;
   }
@@ -417,11 +436,11 @@ async function handle(phone, texto) {
     }
 
     if (esSi(t) || t.includes('agend')) {
-      const citaActiva = await getCitaActiva(c.correo);
+      const citaActiva = await getCitaActivaGoogle(c.nombre, c.correo);
       if (citaActiva) {
-        c.citaPendiente = citaActiva.uri;
+        c.citaPendiente = citaActiva.id;
         c.estado = E.CA;
-        const fecha = formatFecha(citaActiva.start_time);
+        const fecha = formatFecha(citaActiva);
         await sendButtons(phone,
           'Ya tienes una cita agendada el *' + fecha + '* 📅\n\n¿Que quieres hacer?',
           ['🔄 Cancelar y reagendar', '✅ Dejar asi']
@@ -449,7 +468,7 @@ async function handle(phone, texto) {
   // CANCELACION
   if (c.estado === E.CA) {
     if (esSi(t) || t.includes('cancel') || t.includes('reagend')) {
-      const ok = await cancelarCita(c.citaPendiente);
+      const ok = await cancelarCitaGoogle(c.citaPendiente);
       c.citaPendiente = null;
       if (ok) {
         c.ultimoSrv = c.srvPendiente;
